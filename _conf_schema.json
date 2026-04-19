@@ -1,0 +1,99 @@
+{
+  "server_settings": {
+    "description": "服务端设置",
+    "hint": "配置本机作为知识库服务器的行为",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用知识库服务端",
+        "hint": "开启后本实例可作为知识库服务器，接受远程查询请求",
+        "type": "bool",
+        "default": true
+      },
+      "host": {
+        "description": "监听地址",
+        "hint": "HTTP服务监听地址。设置为0.0.0.0则监听所有网络接口，设置为127.0.0.1则仅本地访问",
+        "type": "string",
+        "default": "0.0.0.0"
+      },
+      "port": {
+        "description": "监听端口",
+        "hint": "HTTP服务监听端口，注意避免与其他服务端口冲突",
+        "type": "int",
+        "default": 8550
+      },
+      "api_key": {
+        "description": "API认证密钥",
+        "hint": "为空则不启用认证。建议设置一个强密钥保护知识库访问",
+        "type": "string",
+        "obvious_hint": true,
+        "default": ""
+      },
+      "cors_enabled": {
+        "description": "启用CORS支持",
+        "hint": "允许跨域请求，关闭后可提高安全性",
+        "type": "bool",
+        "default": true
+      },
+      "allowed_kb_names": {
+        "description": "允许暴露的知识库",
+        "hint": "留空则暴露所有知识库；填入知识库名称则只暴露指定的知识库。名称需与知识库管理中的名称一致",
+        "type": "list",
+        "default": []
+      }
+    }
+  },
+  "client_settings": {
+    "description": "客户端设置",
+    "hint": "配置本机作为客户端，查询远程AstrBot知识库",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用知识库客户端",
+        "hint": "开启后可向远程Astrbot实例查询知识库",
+        "type": "bool",
+        "default": false
+      },
+      "remote_servers": {
+        "description": "远程服务器列表",
+        "hint": "配置要连接的远程AstrBot知识库服务器",
+        "type": "template_list",
+        "templates": {
+          "remote_server": {
+            "name": "远程服务器",
+            "hint": "添加一个远程AstrBot知识库服务器",
+            "items": {
+              "name": {
+                "description": "服务器名称",
+                "hint": "用于在查询时指定知识库来源的标识符",
+                "type": "string"
+              },
+              "base_url": {
+                "description": "服务器地址",
+                "hint": "远程AstrBot服务器的HTTP地址，格式: http://host:port",
+                "type": "string"
+              },
+              "api_key": {
+                "description": "API密钥",
+                "hint": "远程服务器的API密钥，需与目标服务器的api_key配置一致",
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "default_top_k": {
+        "description": "默认检索返回结果数",
+        "hint": "当查询未指定top_k时使用此值",
+        "type": "int",
+        "default": 5
+      },
+      "default_top_m": {
+        "description": "最终返回结果数",
+        "hint": "经过重排序后最终返回的结果数量",
+        "type": "int",
+        "default": 3
+      }
+    }
+  }
+}
