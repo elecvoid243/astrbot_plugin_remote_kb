@@ -96,6 +96,7 @@ class RemoteKBSPlugin(Star):
         if self._client_session:
             await self._client_session.close()
 
+        self._client_session = None
         logger.info("RemoteKB Plugin: 已停止")
 
     # ==================== 配置提取辅助方法 ====================
@@ -701,7 +702,6 @@ class RemoteKBSPlugin(Star):
         """查询远程知识库
 
         用法: /remote_kb_query <服务器名> <查询内容>
-        注意: 查询内容可以包含空格，会自动拼接
         """
         if not server or not query:
             yield event.plain_result("用法: /remote_kb_query <服务器名> <查询内容>\n例如: /remote_kb_query myserver 什么是AstrBot")
