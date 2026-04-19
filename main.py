@@ -15,6 +15,7 @@ Created: 2026-04-15
 import asyncio
 import base64
 import binascii
+import hmac
 import json
 import traceback
 from typing import Any, Optional
@@ -180,11 +181,9 @@ class RemoteKBSPlugin(Star):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:]
-            if token == api_key:
+            # 使用 hmac.compare_digest 防止时序攻击
+            if hmac.compare_digest(token, api_key):
                 return await handler(request)
-
-        if request.method == "OPTIONS":
-            return await handler(request)
 
         return web.json_response(
             {"error": "Unauthorized", "message": "Invalid or missing API key"},
@@ -203,6 +202,12 @@ class RemoteKBSPlugin(Star):
         """处理 CORS 预检请求"""
         response = web.Response()
         return self._add_cors_headers(response)
+
+    def _json_error_response(self, status: int, message: str, log_error: str = None) -> web.Response:
+        """返回统一的 JSON 错误响应，避免泄露敏感信息"""
+        if log_error:
+            logger.error(log_error)
+        return web.json_response({"error": message}, status=status)
 
     async def _handle_index(self, request: web.Request) -> web.Response:
         """首页处理"""
@@ -232,9 +237,9 @@ class RemoteKBSPlugin(Star):
         """列出所有知识库"""
         try:
             if not self.kb_manager:
-                return web.json_response(
-                    {"error": "Knowledge base not available"},
-                    status=503
+                return self._json_error_response(
+                    503, "Knowledge base not available",
+                    "Knowledge base manager not available"
                 )
 
             kbs = await self.kb_manager.list_kbs()
@@ -262,8 +267,10 @@ class RemoteKBSPlugin(Star):
             return self._add_cors_headers(response)
 
         except Exception as e:
-            logger.error(f"Error listing KBs: {e}\n{traceback.format_exc()}")
-            return web.json_response({"error": str(e)}, status=500)
+            return self._json_error_response(
+                500, "Internal Server Error",
+                f"Error listing KBs: {e}\n{traceback.format_exc()}"
+            )
 
     async def _handle_get_kb_info(self, request: web.Request) -> web.Response:
         """获取指定知识库的详细信息"""
@@ -271,16 +278,16 @@ class RemoteKBSPlugin(Star):
             kb_name = request.match_info["kb_name"]
 
             if not self.kb_manager:
-                return web.json_response(
-                    {"error": "Knowledge base not available"},
-                    status=503
+                return self._json_error_response(
+                    503, "Knowledge base not available",
+                    "Knowledge base manager not available"
                 )
 
             kb_helper = await self.kb_manager.get_kb_by_name(kb_name)
             if not kb_helper:
-                return web.json_response(
-                    {"error": f"Knowledge base '{kb_name}' not found"},
-                    status=404
+                return self._json_error_response(
+                    404, f"Knowledge base '{kb_name}' not found",
+                    f"Knowledge base not found: {kb_name}"
                 )
 
             kb = kb_helper.kb
@@ -306,19 +313,27 @@ class RemoteKBSPlugin(Star):
             return self._add_cors_headers(response)
 
         except Exception as e:
-            logger.error(f"Error getting KB info: {e}\n{traceback.format_exc()}")
-            return web.json_response({"error": str(e)}, status=500)
+            return self._json_error_response(
+                500, "Internal Server Error",
+                f"Error getting KB info: {e}\n{traceback.format_exc()}"
+            )
 
     async def _handle_retrieve(self, request: web.Request) -> web.Response:
         """知识库检索API"""
         try:
             data = await request.json()
         except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON body"}, status=400)
+            return self._json_error_response(
+                400, "Invalid JSON body",
+                "Failed to parse JSON request body"
+            )
 
         query = data.get("query", "")
         if not query:
-            return web.json_response({"error": "Missing required field: query"}, status=400)
+            return self._json_error_response(
+                400, "Missing required field: query",
+                "Query field is missing"
+            )
 
         # 使用辅助方法获取默认参数
         default_top_k, default_top_m = self._get_default_retrieve_params()
@@ -329,7 +344,7 @@ class RemoteKBSPlugin(Star):
 
         # 获取允许的知识库列表
         allowed_kb_names = self.app.get("allowed_kb_names", []) if self.app else []
-        # 确保 allowed_kb_names 是列表且不为空
+        # 确保 allowed_kb_names 是列表
         if not isinstance(allowed_kb_names, list):
             allowed_kb_names = []
 
@@ -340,11 +355,18 @@ class RemoteKBSPlugin(Star):
             else:
                 kb_names = allowed_kb_names
 
+            # 越权查询漏洞修复: 如果过滤后为空列表，说明请求的知识库都不在白名单中
+            if not kb_names:
+                return self._json_error_response(
+                    403, "Access denied: requested knowledge base(s) are not in the allowed list",
+                    f"Potential privilege bypass attempt - requested KBs not in allowed list"
+                )
+
         try:
             if not self.kb_manager:
-                return web.json_response(
-                    {"error": "Knowledge base not available"},
-                    status=503
+                return self._json_error_response(
+                    503, "Knowledge base not available",
+                    "Knowledge base manager not available"
                 )
 
             result = await self.kb_manager.retrieve(
@@ -361,8 +383,10 @@ class RemoteKBSPlugin(Star):
             return self._add_cors_headers(response)
 
         except Exception as e:
-            logger.error(f"Error retrieving: {e}\n{traceback.format_exc()}")
-            return web.json_response({"error": str(e)}, status=500)
+            return self._json_error_response(
+                500, "Internal Server Error",
+                f"Error retrieving: {e}\n{traceback.format_exc()}"
+            )
 
     async def _handle_upload_document(self, request: web.Request) -> web.Response:
         """上传文档到知识库API"""
@@ -384,9 +408,9 @@ class RemoteKBSPlugin(Star):
                         kb_name = (await part.text()).strip() or kb_name
 
                 if not file_content:
-                    return web.json_response(
-                        {"error": "No file content received"},
-                        status=400
+                    return self._json_error_response(
+                        400, "No file content received",
+                        "Upload file content is empty"
                     )
 
                 doc = await self._upload_to_kb(kb_name, file_name, file_content)
@@ -406,18 +430,18 @@ class RemoteKBSPlugin(Star):
                 file_content_b64 = data.get("content")
 
                 if not file_content_b64:
-                    return web.json_response(
-                        {"error": "Missing required field: content (base64 encoded)"},
-                        status=400
+                    return self._json_error_response(
+                        400, "Missing required field: content (base64 encoded)",
+                        "Upload content field is missing"
                     )
 
                 # 添加 Base64 解码异常处理
                 try:
                     file_content = base64.b64decode(file_content_b64)
                 except binascii.Error:
-                    return web.json_response(
-                        {"error": "Invalid Base64 content"},
-                        status=400
+                    return self._json_error_response(
+                        400, "Invalid Base64 content",
+                        f"Invalid Base64 content for file: {file_name}"
                     )
 
                 doc = await self._upload_to_kb(kb_name, file_name, file_content)
@@ -432,8 +456,10 @@ class RemoteKBSPlugin(Star):
                 return self._add_cors_headers(response)
 
         except Exception as e:
-            logger.error(f"Error uploading document: {e}\n{traceback.format_exc()}")
-            return web.json_response({"error": str(e)}, status=500)
+            return self._json_error_response(
+                500, "Internal Server Error",
+                f"Error uploading document: {e}\n{traceback.format_exc()}"
+            )
 
     async def _upload_to_kb(self, kb_name: str, file_name: str,
                            file_content: bytes) -> Any:
@@ -675,6 +701,7 @@ class RemoteKBSPlugin(Star):
         """查询远程知识库
 
         用法: /remote_kb_query <服务器名> <查询内容>
+        注意: 查询内容可以包含空格，会自动拼接
         """
         if not server or not query:
             yield event.plain_result("用法: /remote_kb_query <服务器名> <查询内容>\n例如: /remote_kb_query myserver 什么是AstrBot")
