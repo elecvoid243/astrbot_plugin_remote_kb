@@ -38,10 +38,9 @@ class RemoteKBSPlugin(Star):
     """
     远程知识库插件
 
-    提供三种工作模式:
+    提供2种工作模式:
     1. Server Mode (服务端模式): 启动HTTP服务器，提供知识库查询API
     2. Client Mode (客户端模式): 向远程Astrbot实例查询知识库
-    3. Agent工具模式: 为Agent提供远程知识库查询能力 (astrbot_remote_kb_search)
     """
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -106,10 +105,10 @@ class RemoteKBSPlugin(Star):
         client_settings = self.config.get("client_settings", {})
         if isinstance(client_settings, dict):
             return (
-                client_settings.get("default_top_k", 5),
-                client_settings.get("default_top_m", 3)
+                client_settings.get("default_top_k", 10),
+                client_settings.get("default_top_m", 5)
             )
-        return (5, 3)
+        return (10, 5)
 
     def _get_server_config(self, server_name: str) -> Optional[dict]:
         """根据服务器名称获取服务器配置"""
