@@ -1,5 +1,5 @@
 name: astrbot_plugin_remote_kb
-version: 1.1.0
+version: 1.2.0
 author: elecvoid243
 description: 将Astrbot知识库查询功能包装为HTTP服务，支持跨Astrbot实例的知识库共享与查询。服务端和客户端都需要安装
 display_name: 远程知识库插件

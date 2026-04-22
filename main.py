@@ -10,15 +10,14 @@ AstrBot 远程知识库插件
 
 Author: elecvoid243
 Created: 2026-04-15
+Modified: 2026-04-22
 """
 
 import asyncio
-import base64
-import binascii
-import hmac
 import json
+import random
 import traceback
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import aiohttp
 from aiohttp import web
@@ -29,11 +28,31 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig
 
 
+# ==================== 常量定义 ====================
+
+PLUGIN_VERSION = "1.2.0"
+PLUGIN_NAME = "astrbot_plugin_remote_kb"
+
+# 支持的知识库文档类型（用于校验）
+SUPPORTED_FILE_TYPES = {"txt", "pdf", "docx", "md", "html"}
+
+# 默认请求超时（秒）
+DEFAULT_TIMEOUT = 60
+HEALTH_CHECK_TIMEOUT = 10
+LIST_KBS_TIMEOUT = 30
+
+# 客户端请求最大重试次数
+MAX_RETRIES = 2
+
+# 服务端请求体大小限制（50MB）
+MAX_CLIENT_SIZE = 50 * 1024 * 1024
+
+
 # ==================== 插件主体 ====================
 
-@register("astrbot_plugin_remote_kb", "elecvoid243",
+@register(PLUGIN_NAME, "elecvoid243",
            "将Astrbot知识库查询功能包装为HTTP服务，支持跨Astrbot实例的知识库共享与查询。服务端和客户端都需要安装",
-           "1.1.0")
+           PLUGIN_VERSION)
 class RemoteKBSPlugin(Star):
     """
     远程知识库插件
@@ -51,12 +70,17 @@ class RemoteKBSPlugin(Star):
         self.app: Optional[web.Application] = None
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
+        self._server_task: Optional[asyncio.Task] = None
 
         # 知识库管理器
         self.kb_manager = None
 
         # 客户端会话
         self._client_session: Optional[aiohttp.ClientSession] = None
+        self._session_lock = asyncio.Lock()
+
+        # 工具描述缓存
+        self._cached_tool_description: Optional[str] = None
 
     async def initialize(self) -> None:
         """插件初始化"""
@@ -68,7 +92,11 @@ class RemoteKBSPlugin(Star):
         # 读取服务端配置
         server_settings = self.config.get("server_settings", {})
         if isinstance(server_settings, dict) and server_settings.get("enabled", True):
-            asyncio.create_task(self._start_server())
+            self._server_task = asyncio.create_task(
+                self._start_server(),
+                name="remote_kb_server"
+            )
+            self._server_task.add_done_callback(self._on_server_task_done)
             host = server_settings.get("host", "0.0.0.0")
             port = server_settings.get("port", 8550)
             logger.info(f"RemoteKB Plugin: 服务端模式已启用，将监听 {host}:{port}")
@@ -77,7 +105,7 @@ class RemoteKBSPlugin(Star):
         client_settings = self.config.get("client_settings", {})
         if isinstance(client_settings, dict) and client_settings.get("enabled", False):
             logger.info("RemoteKB Plugin: 客户端模式已启用")
-            self._client_session = aiohttp.ClientSession()
+            await self._ensure_client_session()
 
         logger.info("RemoteKB Plugin: 初始化完成")
 
@@ -85,18 +113,39 @@ class RemoteKBSPlugin(Star):
         """插件卸载/停用时的清理"""
         logger.info("RemoteKB Plugin: 正在停止...")
 
+        # 取消服务端任务
+        if self._server_task and not self._server_task.done():
+            self._server_task.cancel()
+            try:
+                await self._server_task
+            except asyncio.CancelledError:
+                pass
+
+        # 清理HTTP服务
         if self.site:
             await self.site.stop()
         if self.runner:
             await self.runner.cleanup()
-        if self.app:
-            self.app = None
+        self.app = None
+        self.site = None
+        self.runner = None
 
-        if self._client_session:
-            await self._client_session.close()
+        # 关闭客户端会话
+        async with self._session_lock:
+            if self._client_session and not self._client_session.closed:
+                await self._client_session.close()
+            self._client_session = None
 
-        self._client_session = None
         logger.info("RemoteKB Plugin: 已停止")
+
+    def _on_server_task_done(self, task: asyncio.Task) -> None:
+        """服务端任务完成回调，用于捕获异常"""
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.info("RemoteKB server task was cancelled")
+        except Exception as e:
+            logger.error(f"RemoteKB server task failed: {e}")
 
     # ==================== 配置提取辅助方法 ====================
 
@@ -139,7 +188,12 @@ class RemoteKBSPlugin(Star):
         logger.info(f"[RemoteKB] Server config loaded - allowed_kb_names: {allowed_kb_names}")
 
         self.app = web.Application(
-            middlewares=[self._auth_middleware]
+            middlewares=[
+                self._logging_middleware,
+                self._cors_middleware,
+                self._auth_middleware
+            ],
+            client_max_size=MAX_CLIENT_SIZE
         )
 
         # 保存配置供中间件使用
@@ -153,24 +207,63 @@ class RemoteKBSPlugin(Star):
         self.app.router.add_get("/api/kbs", self._handle_list_kbs)
         self.app.router.add_post("/api/retrieve", self._handle_retrieve)
         self.app.router.add_get("/api/kb/{kb_name}", self._handle_get_kb_info)
-        self.app.router.add_post("/api/kb/{kb_name}/upload", self._handle_upload_document)
-
-        # 注册 CORS 预检请求处理器
-        self.app.router.add_options("/api/retrieve", self._handle_cors_preflight)
-        self.app.router.add_options("/api/kbs", self._handle_cors_preflight)
-        self.app.router.add_options("/api/kb/{kb_name}", self._handle_cors_preflight)
-        self.app.router.add_options("/api/kb/{kb_name}/upload", self._handle_cors_preflight)
 
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
         self.site = web.TCPSite(self.runner, host, port)
-        await self.site.start()
+
+        try:
+            await self.site.start()
+        except OSError as e:
+            if e.errno == 10048:  # Windows: WSAEADDRINUSE
+                logger.error(f"[RemoteKB] Port {port} is already in use. Server failed to start.")
+                raise RuntimeError(f"Port {port} is already in use") from e
+            raise
 
         logger.info(f"RemoteKB HTTP Server started at http://{host}:{port}")
 
     @web.middleware
+    async def _logging_middleware(self, request: web.Request, handler) -> web.Response:
+        """请求日志中间件"""
+        start_time = asyncio.get_event_loop().time()
+        try:
+            response = await handler(request)
+            duration = (asyncio.get_event_loop().time() - start_time) * 1000
+            logger.info(
+                f"{request.remote} - {request.method} {request.path} "
+                f"- {response.status} - {duration:.2f}ms"
+            )
+            return response
+        except Exception as e:
+            duration = (asyncio.get_event_loop().time() - start_time) * 1000
+            logger.error(
+                f"{request.remote} - {request.method} {request.path} "
+                f"- ERROR - {duration:.2f}ms - {e}"
+            )
+            raise
+
+    @web.middleware
+    async def _cors_middleware(self, request: web.Request, handler) -> web.Response:
+        """CORS中间件 - 统一处理跨域请求"""
+        # 处理预检请求
+        if request.method == "OPTIONS":
+            response = web.Response()
+        else:
+            response = await handler(request)
+
+        if self.app and self.app.get("cors_enabled", True):
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        return response
+
+    @web.middleware
     async def _auth_middleware(self, request: web.Request, handler) -> web.Response:
-        """认证中间件"""
+        """认证中间件 - 跳过OPTIONS预检请求"""
+        # 跳过CORS预检请求，浏览器OPTIONS请求通常不携带Authorization头
+        if request.method == "OPTIONS":
+            return await handler(request)
+
         api_key = ""
         if self.app and "api_key" in self.app:
             api_key = self.app["api_key"]
@@ -182,6 +275,7 @@ class RemoteKBSPlugin(Star):
         if auth_header.startswith("Bearer "):
             token = auth_header[7:]
             # 使用 hmac.compare_digest 防止时序攻击
+            import hmac
             if hmac.compare_digest(token, api_key):
                 return await handler(request)
 
@@ -189,19 +283,6 @@ class RemoteKBSPlugin(Star):
             {"error": "Unauthorized", "message": "Invalid or missing API key"},
             status=401
         )
-
-    def _add_cors_headers(self, response: web.Response) -> web.Response:
-        """添加CORS头"""
-        if self.app and self.app.get("cors_enabled", True):
-            response.headers["Access-Control-Allow-Origin"] = "*"
-            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-        return response
-
-    async def _handle_cors_preflight(self, request: web.Request) -> web.Response:
-        """处理 CORS 预检请求"""
-        response = web.Response()
-        return self._add_cors_headers(response)
 
     def _json_error_response(self, status: int, message: str, log_error: str = None) -> web.Response:
         """返回统一的 JSON 错误响应，避免泄露敏感信息"""
@@ -211,27 +292,24 @@ class RemoteKBSPlugin(Star):
 
     async def _handle_index(self, request: web.Request) -> web.Response:
         """首页处理"""
-        response = web.json_response({
+        return web.json_response({
             "service": "AstrBot Remote KB Server",
-            "version": "1.2.0",
+            "version": PLUGIN_VERSION,
             "endpoints": {
                 "health": "/health",
                 "list_kbs": "/api/kbs",
                 "retrieve": "/api/retrieve",
-                "kb_info": "/api/kb/{kb_name}",
-                "upload": "/api/kb/{kb_name}/upload"
+                "kb_info": "/api/kb/{kb_name}"
             }
         })
-        return self._add_cors_headers(response)
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         """健康检查"""
         kb_status = "available" if self.kb_manager else "unavailable"
-        response = web.json_response({
+        return web.json_response({
             "status": "healthy",
             "knowledge_base": kb_status
         })
-        return self._add_cors_headers(response)
 
     async def _handle_list_kbs(self, request: web.Request) -> web.Response:
         """列出所有知识库"""
@@ -263,8 +341,7 @@ class RemoteKBSPlugin(Star):
                     "chunk_count": getattr(kb, 'chunk_count', 0)
                 })
 
-            response = web.json_response({"knowledge_bases": kb_list})
-            return self._add_cors_headers(response)
+            return web.json_response({"knowledge_bases": kb_list})
 
         except Exception as e:
             return self._json_error_response(
@@ -302,7 +379,7 @@ class RemoteKBSPlugin(Star):
                     "created_at": str(doc.created_at) if doc.created_at else None
                 })
 
-            response = web.json_response({
+            return web.json_response({
                 "kb_id": kb.kb_id,
                 "kb_name": kb.kb_name,
                 "description": kb.description,
@@ -310,7 +387,6 @@ class RemoteKBSPlugin(Star):
                 "doc_count": len(doc_list),
                 "documents": doc_list
             })
-            return self._add_cors_headers(response)
 
         except Exception as e:
             return self._json_error_response(
@@ -322,7 +398,8 @@ class RemoteKBSPlugin(Star):
         """知识库检索API"""
         try:
             data = await request.json()
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid JSON from {request.remote}: {e}")
             return self._json_error_response(
                 400, "Invalid JSON body",
                 "Failed to parse JSON request body"
@@ -379,107 +456,17 @@ class RemoteKBSPlugin(Star):
             if not result:
                 result = {"context_text": "", "results": []}
 
-            response = web.json_response(result)
-            return self._add_cors_headers(response)
+            return web.json_response(result)
 
+        except ValueError as e:
+            logger.info(f"Validation error in retrieve: {e}")
+            return self._json_error_response(400, str(e))
         except Exception as e:
+            logger.exception(f"Unexpected error in retrieve: {e}")
             return self._json_error_response(
                 500, "Internal Server Error",
                 f"Error retrieving: {e}\n{traceback.format_exc()}"
             )
-
-    async def _handle_upload_document(self, request: web.Request) -> web.Response:
-        """上传文档到知识库API"""
-        kb_name = request.match_info["kb_name"]
-
-        try:
-            content_type = request.headers.get("Content-Type", "")
-
-            if "multipart/form-data" in content_type:
-                reader = await request.multipart()
-                file_name = "uploaded_file"
-                file_content = b""
-
-                async for part in reader:
-                    if part.name == "file":
-                        file_name = part.filename or file_name
-                        file_content = await part.read()
-                    elif part.name == "kb_name":
-                        kb_name = (await part.text()).strip() or kb_name
-
-                if not file_content:
-                    return self._json_error_response(
-                        400, "No file content received",
-                        "Upload file content is empty"
-                    )
-
-                doc = await self._upload_to_kb(kb_name, file_name, file_content)
-                response = web.json_response({
-                    "success": True,
-                    "document": {
-                        "doc_id": doc.doc_id,
-                        "doc_name": doc.doc_name,
-                        "chunk_count": doc.chunk_count
-                    }
-                })
-                return self._add_cors_headers(response)
-
-            else:
-                data = await request.json()
-                file_name = data.get("file_name", "document.txt")
-                file_content_b64 = data.get("content")
-
-                if not file_content_b64:
-                    return self._json_error_response(
-                        400, "Missing required field: content (base64 encoded)",
-                        "Upload content field is missing"
-                    )
-
-                # 添加 Base64 解码异常处理
-                try:
-                    file_content = base64.b64decode(file_content_b64)
-                except binascii.Error:
-                    return self._json_error_response(
-                        400, "Invalid Base64 content",
-                        f"Invalid Base64 content for file: {file_name}"
-                    )
-
-                doc = await self._upload_to_kb(kb_name, file_name, file_content)
-                response = web.json_response({
-                    "success": True,
-                    "document": {
-                        "doc_id": doc.doc_id,
-                        "doc_name": doc.doc_name,
-                        "chunk_count": doc.chunk_count
-                    }
-                })
-                return self._add_cors_headers(response)
-
-        except Exception as e:
-            return self._json_error_response(
-                500, "Internal Server Error",
-                f"Error uploading document: {e}\n{traceback.format_exc()}"
-            )
-
-    async def _upload_to_kb(self, kb_name: str, file_name: str,
-                           file_content: bytes) -> Any:
-        """上传文档到指定知识库"""
-        kb_helper = await self.kb_manager.get_kb_by_name(kb_name)
-        if not kb_helper:
-            raise ValueError(f"Knowledge base '{kb_name}' not found")
-
-        file_ext = file_name.split(".")[-1].lower() if "." in file_name else "txt"
-
-        doc = await kb_helper.upload_document(
-            file_name=file_name,
-            file_content=file_content,
-            file_type=file_ext,
-            chunk_size=512,
-            chunk_overlap=50,
-            batch_size=32
-        )
-
-        return doc
 
     # ==================== 客户端模式实现 ====================
 
@@ -491,10 +478,11 @@ class RemoteKBSPlugin(Star):
         return []
 
     async def _ensure_client_session(self) -> aiohttp.ClientSession:
-        """确保客户端会话已创建"""
-        if not self._client_session:
-            self._client_session = aiohttp.ClientSession()
-        return self._client_session
+        """确保客户端会话已创建（线程安全）"""
+        async with self._session_lock:
+            if not self._client_session or self._client_session.closed:
+                self._client_session = aiohttp.ClientSession()
+            return self._client_session
 
     async def _query_remote_server(
         self,
@@ -504,9 +492,7 @@ class RemoteKBSPlugin(Star):
         top_k_fusion: int = 5,
         top_m_final: int = 3
     ) -> Optional[dict]:
-        """向远程知识库服务器发起查询"""
-        session = await self._ensure_client_session()
-
+        """向远程知识库服务器发起查询（带指数退避重试）"""
         server_config = self._get_server_config(server_name)
         if not server_config:
             logger.error(f"Remote server '{server_name}' not found in config")
@@ -527,26 +513,40 @@ class RemoteKBSPlugin(Star):
         if kb_names:
             payload["kb_names"] = kb_names
 
-        try:
-            async with session.post(
-                f"{base_url}/api/retrieve",
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=60)
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                elif resp.status == 401:
-                    logger.error(f"Authentication failed for server '{server_name}'")
-                    return None
-                else:
-                    text = await resp.text()
-                    logger.error(f"Error from server '{server_name}': {resp.status} - {text}")
-                    return None
+        last_exception = None
+        for attempt in range(MAX_RETRIES + 1):
+            session = await self._ensure_client_session()
+            try:
+                async with session.post(
+                    f"{base_url}/api/retrieve",
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 401:
+                        logger.error(f"Authentication failed for server '{server_name}'")
+                        return None
+                    else:
+                        text = await resp.text()
+                        logger.error(f"Error from server '{server_name}': {resp.status} - {text}")
+                        return None
 
-        except aiohttp.ClientError as e:
-            logger.error(f"Connection error to server '{server_name}': {e}")
-            return None
+            except aiohttp.ClientError as e:
+                last_exception = e
+                if attempt < MAX_RETRIES:
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(
+                        f"Request to '{server_name}' failed, retrying in {wait:.1f}s: {e}"
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(
+                        f"Request to '{server_name}' failed after {MAX_RETRIES + 1} attempts: {e}"
+                    )
+
+        return None
 
     async def _list_remote_kbs(self, server_name: str) -> Optional[list]:
         """获取远程服务器的知识库列表"""
@@ -567,7 +567,7 @@ class RemoteKBSPlugin(Star):
             async with session.get(
                 f"{base_url}/api/kbs",
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30)
+                timeout=aiohttp.ClientTimeout(total=LIST_KBS_TIMEOUT)
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -575,21 +575,26 @@ class RemoteKBSPlugin(Star):
                 return None
 
         except aiohttp.ClientError as e:
-            logger.error(f"Error listing remote KBs: {e}")
+            logger.error(f"Error listing remote KBs from '{server_name}': {e}")
             return None
 
     # ==================== Agent LLM 工具 ====================
 
     def _get_tool_description(self) -> str:
-        """获取工具描述，包含配置的远程服务器信息"""
+        """获取工具描述，包含配置的远程服务器信息（带缓存）"""
+        if self._cached_tool_description is not None:
+            return self._cached_tool_description
+
         servers = self._get_remote_servers()
 
         if not servers:
-            return (
+            description = (
                 "Query the remote knowledge base for facts or relevant context. "
                 "NOTE: No remote servers are currently configured. "
                 "Please contact the administrator to configure remote knowledge base servers."
             )
+            self._cached_tool_description = description
+            return description
 
         # 构建服务器描述
         server_lines = []
@@ -599,15 +604,21 @@ class RemoteKBSPlugin(Star):
 
         server_info = "\n".join(server_lines)
 
-        return (
+        description = (
             "Query the remote knowledge base for facts or relevant context. "
             "Use this tool when the user's question requires information stored in remote knowledge bases. "
             f"Available remote servers:\n{server_info}\n\n"
             "IMPORTANT: You MUST specify the 'server_name' parameter to select which remote server to query."
         )
+        self._cached_tool_description = description
+        return description
+
+    def _invalidate_tool_cache(self) -> None:
+        """清除工具描述缓存（配置变更时调用）"""
+        self._cached_tool_description = None
 
     @filter.llm_tool(name="astrbot_remote_kb_search")
-    async def tool_remote_kb_search(self, event: AstrMessageEvent, server_name: str, query: str, kb_names: list[str] | str | None = None):
+    async def tool_remote_kb_search(self, event: AstrMessageEvent, server_name: str, query: str, kb_names: Optional[Union[list[str], str]] = None):
         '''Query the remote knowledge base for facts or relevant context.
 
         Args:
@@ -756,7 +767,7 @@ class RemoteKBSPlugin(Star):
                 async with session.get(
                     f"{base_url}/health",
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10)
+                    timeout=aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT)
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
